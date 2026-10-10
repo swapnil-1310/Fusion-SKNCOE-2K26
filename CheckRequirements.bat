@@ -13,9 +13,9 @@ if not exist "%PROJECT_PYTHON%" (
 )
 
 echo Checking project Python version...
-"%PROJECT_PYTHON%" -c "import sys; print('Python', sys.version.split()[0]); sys.exit(0 if sys.version_info[:2] == (3, 11) else 1)"
+"%PROJECT_PYTHON%" -c "import sys; print('Python', sys.version.split()[0]); sys.exit(0 if sys.version_info[:2] in ((3, 11), (3, 12)) else 1)"
 if errorlevel 1 (
-    echo ERROR: This project expects Python 3.11.x in .venv.
+    echo ERROR: This project expects Python 3.11.x or 3.12.x in .venv.
     popd
     exit /b 1
 )

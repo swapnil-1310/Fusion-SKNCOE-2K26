@@ -3,16 +3,32 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
 
-import av
+try:
+    import av
+    _AV_FFMPEG_ERROR = av.error.FFmpegError
+except (ImportError, AttributeError):
+    av = None
+    _AV_FFMPEG_ERROR = Exception
+
 import cv2
-import mediapipe as mp
 import numpy as np
-import torch
+
+try:
+    import mediapipe as mp
+except ImportError:
+    mp = None
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
 from PIL import Image
 
 
@@ -38,6 +54,7 @@ _classifier: Any = None
 _model_error: str | None = None
 _face_detector: Any = None
 _face_detector_error: str | None = None
+_cv2_face_cascade: Any = None
 
 
 def _load_video_model() -> None:
@@ -45,6 +62,9 @@ def _load_video_model() -> None:
     if _classifier is not None:
         return
     if _model_error is not None:
+        raise RuntimeError(_model_error)
+    if torch is None:
+        _model_error = "Video classifier requires PyTorch (torch), which is not installed in this environment."
         raise RuntimeError(_model_error)
     try:
         from transformers import AutoImageProcessor, AutoModelForImageClassification
@@ -112,25 +132,35 @@ def _get_face_detector() -> Any:
     if _face_detector is None:
         if _face_detector_error is not None:
             raise RuntimeError(_face_detector_error)
+        if mp is None:
+            _face_detector_error = "MediaPipe is not installed in this environment."
+            raise RuntimeError(_face_detector_error)
         try:
-            FACE_DETECTOR_PATH.parent.mkdir(parents=True, exist_ok=True)
-            if not FACE_DETECTOR_PATH.exists():
+            target_path = FACE_DETECTOR_PATH
+            try:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                # Writable fallback on read-only serverless platforms (e.g. Vercel)
+                target_path = Path(tempfile.gettempdir()) / "models" / "blaze_face_short_range.tflite"
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if not target_path.exists():
                 with urlopen(FACE_DETECTOR_URL, timeout=30) as response:
                     model_bytes = response.read(1_000_001)
                 if len(model_bytes) > 1_000_000:
                     raise RuntimeError("The face-detection model exceeded its 1 MB download limit.")
                 if hashlib.sha256(model_bytes).hexdigest() != FACE_DETECTOR_SHA256:
                     raise RuntimeError("The downloaded face-detection model checksum did not match.")
-                partial_path = FACE_DETECTOR_PATH.with_suffix(".download")
+                partial_path = target_path.with_suffix(".download")
                 partial_path.write_bytes(model_bytes)
-                os.replace(partial_path, FACE_DETECTOR_PATH)
-            elif hashlib.sha256(FACE_DETECTOR_PATH.read_bytes()).hexdigest() != FACE_DETECTOR_SHA256:
+                os.replace(partial_path, target_path)
+            elif hashlib.sha256(target_path.read_bytes()).hexdigest() != FACE_DETECTOR_SHA256:
                 raise RuntimeError("The cached face-detection model checksum did not match.")
             from mediapipe.tasks import python as mp_python
             from mediapipe.tasks.python import vision
 
             options = vision.FaceDetectorOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=str(FACE_DETECTOR_PATH)),
+                base_options=mp_python.BaseOptions(model_asset_path=str(target_path)),
                 running_mode=vision.RunningMode.IMAGE,
                 min_detection_confidence=0.6,
             )
@@ -141,6 +171,20 @@ def _get_face_detector() -> Any:
             )
             raise RuntimeError(_face_detector_error) from error
     return _face_detector
+
+
+def _get_cv2_face_cascade() -> Any:
+    global _cv2_face_cascade
+    if _cv2_face_cascade is not None:
+        return _cv2_face_cascade
+    try:
+        cascade_dir = getattr(cv2, "data", None)
+        cascade_path = (cascade_dir.haarcascades if cascade_dir else "") + "haarcascade_frontalface_default.xml"
+        if os.path.exists(cascade_path):
+            _cv2_face_cascade = cv2.CascadeClassifier(cascade_path)
+    except Exception:
+        pass
+    return _cv2_face_cascade
 
 
 def detect_live_faces(frame: np.ndarray) -> list[dict[str, float]]:
@@ -155,20 +199,60 @@ def detect_live_faces(frame: np.ndarray) -> list[dict[str, float]]:
         if scale < 1.0
         else frame
     )
-    rgb = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-    with _model_lock:
-        detections = _get_face_detector().detect(mp_image).detections
     detection_height, detection_width = detection_frame.shape[:2]
-    return [
-        {
-            "x": detection.bounding_box.origin_x / detection_width,
-            "y": detection.bounding_box.origin_y / detection_height,
-            "width": detection.bounding_box.width / detection_width,
-            "height": detection.bounding_box.height / detection_height,
-        }
-        for detection in detections
-    ]
+
+    # Try MediaPipe detector first if available or mocked
+    try:
+        rgb = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2RGB)
+        detector = _get_face_detector()
+        if detector is not None:
+            if mp is not None:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            else:
+                class _MockMPImage:
+                    def __init__(self, data: np.ndarray):
+                        self._data = data
+                    def numpy_view(self) -> np.ndarray:
+                        return self._data
+                mp_image = _MockMPImage(rgb)
+            with _model_lock:
+                detections = detector.detect(mp_image).detections
+            return [
+                {
+                    "x": detection.bounding_box.origin_x / detection_width,
+                    "y": detection.bounding_box.origin_y / detection_height,
+                    "width": detection.bounding_box.width / detection_width,
+                    "height": detection.bounding_box.height / detection_height,
+                }
+                for detection in detections
+            ]
+    except Exception:
+        pass
+
+    # Seamless built-in OpenCV Haar Cascade fallback (always present, zero download, serverless ready)
+    cascade = _get_cv2_face_cascade()
+    if cascade is not None:
+        try:
+            gray = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2GRAY)
+            faces = cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=4,
+                minSize=(28, 28),
+            )
+            return [
+                {
+                    "x": float(x / detection_width),
+                    "y": float(y / detection_height),
+                    "width": float(w / detection_width),
+                    "height": float(h / detection_height),
+                }
+                for (x, y, w, h) in faces
+            ]
+        except Exception:
+            pass
+
+    return []
 
 
 def analyze_video_frame(frame: np.ndarray) -> dict[str, Any]:
@@ -308,6 +392,8 @@ def analyze_video_frame(frame: np.ndarray) -> dict[str, Any]:
 
 def decode_video_frames(video_bytes: bytes) -> list[tuple[int, np.ndarray]]:
     """Decode a complete short recording and sample frames through its final frame."""
+    if av is None:
+        raise ValueError("Video decoding requires the 'av' library, which is not available in this environment.")
     samples: list[tuple[int, np.ndarray]] = []
     decoded_count = 0
     next_sample_at = 0.0
@@ -344,7 +430,7 @@ def decode_video_frames(video_bytes: bytes) -> list[tuple[int, np.ndarray]]:
                 last_sampled_timestamp is None or last_timestamp - last_sampled_timestamp > 0.001
             ):
                 samples.append((round(last_timestamp * 1000), _bounded_video_frame(last_frame)))
-    except av.error.FFmpegError as error:
+    except _AV_FFMPEG_ERROR as error:
         raise ValueError(f"The submitted video could not be decoded: {error}") from error
     if not samples:
         raise ValueError("The submitted recording contains no decodable video frames.")
@@ -353,7 +439,7 @@ def decode_video_frames(video_bytes: bytes) -> list[tuple[int, np.ndarray]]:
     return samples
 
 
-def _bounded_video_frame(frame: av.VideoFrame) -> np.ndarray:
+def _bounded_video_frame(frame: Any) -> np.ndarray:
     image = frame.to_ndarray(format="bgr24")
     height, width = image.shape[:2]
     if width * height > 8_000_000:

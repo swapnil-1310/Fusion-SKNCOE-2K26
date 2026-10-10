@@ -7,9 +7,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
-import av
+try:
+    import av
+except ImportError:
+    av = None
+
 import numpy as np
-import torch
+
+try:
+    import torch
+except ImportError:
+    torch = None
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from backend.app.audit_ledger import SimulatedAuditLedger
@@ -476,6 +484,7 @@ class ScreeningLogicTests(unittest.TestCase):
 
         self.assertEqual(faces, [{"x": 0.25, "y": 0.25, "width": 0.25, "height": 0.5}])
 
+    @unittest.skipIf(torch is None, "PyTorch is required for this test")
     def test_video_classifier_uses_pinned_modern_model_and_context_crop(self) -> None:
         self.assertEqual(screening_module.VIDEO_MODEL_ID, "prithivMLmods/Deep-Fake-Detector-Model")
         self.assertEqual(screening_module.VIDEO_MODEL_REVISION, "c5cb24c6a159dd2b57ca15c6a1065bd0ce8fa380")
@@ -949,6 +958,7 @@ class ScreeningLogicTests(unittest.TestCase):
         self.assertEqual(result["phrase_status"], "unavailable")
         self.assertEqual(result["spoof_status"], "unavailable")
 
+    @unittest.skipIf(torch is None, "PyTorch is required for this test")
     def test_updated_audio_classifier_uses_real_fake_model_labels(self) -> None:
         class FakeProcessor:
             def __call__(self, waveform, **kwargs):
@@ -1072,6 +1082,7 @@ class ScreeningLogicTests(unittest.TestCase):
         self.assertEqual(retry.json()["phrase_check"]["status"], "passed")
         self.assertTrue(challenge.audio_submitted)
 
+    @unittest.skipIf(av is None, "PyAV is required for this test")
     def test_video_decoder_samples_recording_in_memory(self) -> None:
         recording = io.BytesIO()
         container = av.open(recording, mode="w", format="webm")

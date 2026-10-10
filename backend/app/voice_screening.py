@@ -2,13 +2,26 @@ from __future__ import annotations
 
 import difflib
 import io
+import os
+import tempfile
 import threading
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
-import av
+try:
+    import av
+    _AV_FFMPEG_ERROR = av.error.FFmpegError
+except (ImportError, AttributeError):
+    av = None
+    _AV_FFMPEG_ERROR = Exception
+
 import numpy as np
-import torch
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 
 AUDIO_MODEL_ID = "garystafford/wav2vec2-deepfake-voice-detector"
@@ -29,31 +42,62 @@ _whisper_error: str | None = None
 
 
 def decode_audio(audio_bytes: bytes) -> np.ndarray:
+    if av is not None:
+        try:
+            with av.open(io.BytesIO(audio_bytes)) as container:
+                if not container.streams.audio:
+                    raise ValueError("The submitted recording contains no audio stream.")
+                resampler = av.AudioResampler(format="fltp", layout="mono", rate=SAMPLE_RATE)
+                chunks: list[np.ndarray] = []
+                sample_count = 0
+                for frame in container.decode(audio=0):
+                    for resampled in resampler.resample(frame):
+                        samples = resampled.to_ndarray().reshape(-1)
+                        sample_count += samples.size
+                        if sample_count > SAMPLE_RATE * AUDIO_MAX_DURATION_SECONDS:
+                            raise ValueError("Audio must be between 0.3 and 10 seconds long.")
+                        chunks.append(samples)
+            if not chunks:
+                raise ValueError("The submitted recording contains no decodable audio samples.")
+            waveform = np.concatenate(chunks).astype(np.float32, copy=False)
+            duration_seconds = len(waveform) / SAMPLE_RATE
+            if duration_seconds < AUDIO_MIN_DURATION_SECONDS or duration_seconds > AUDIO_MAX_DURATION_SECONDS:
+                raise ValueError("Audio must be between 0.3 and 10 seconds long.")
+            if not np.isfinite(waveform).all():
+                raise ValueError("The submitted recording contains invalid audio samples.")
+            return waveform
+        except (_AV_FFMPEG_ERROR, OSError) as error:
+            # Fall back to wave decoding below if ffmpeg fails
+            pass
+
+    # Built-in standard library WAV audio decoder fallback (zero external dependencies)
     try:
-        with av.open(io.BytesIO(audio_bytes)) as container:
-            if not container.streams.audio:
-                raise ValueError("The submitted recording contains no audio stream.")
-            resampler = av.AudioResampler(format="fltp", layout="mono", rate=SAMPLE_RATE)
-            chunks: list[np.ndarray] = []
-            sample_count = 0
-            for frame in container.decode(audio=0):
-                for resampled in resampler.resample(frame):
-                    samples = resampled.to_ndarray().reshape(-1)
-                    sample_count += samples.size
-                    if sample_count > SAMPLE_RATE * AUDIO_MAX_DURATION_SECONDS:
-                        raise ValueError("Audio must be between 0.3 and 10 seconds long.")
-                    chunks.append(samples)
-    except (av.error.FFmpegError, OSError) as error:
-        raise ValueError(f"The audio recording could not be decoded: {error}") from error
-    if not chunks:
-        raise ValueError("The submitted recording contains no decodable audio samples.")
-    waveform = np.concatenate(chunks).astype(np.float32, copy=False)
-    duration_seconds = len(waveform) / SAMPLE_RATE
-    if duration_seconds < AUDIO_MIN_DURATION_SECONDS or duration_seconds > AUDIO_MAX_DURATION_SECONDS:
-        raise ValueError("Audio must be between 0.3 and 10 seconds long.")
-    if not np.isfinite(waveform).all():
-        raise ValueError("The submitted recording contains invalid audio samples.")
-    return waveform
+        import wave
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+            channels = wf.getnchannels()
+            sample_width = wf.getsampwidth()
+            framerate = wf.getframerate()
+            n_frames = wf.getnframes()
+            frames = wf.readframes(n_frames)
+            if sample_width == 2:
+                raw = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sample_width == 4:
+                raw = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+            else:
+                raw = np.frombuffer(frames, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+            if channels > 1:
+                raw = raw.reshape(-1, channels).mean(axis=1)
+            if framerate != SAMPLE_RATE and len(raw) > 0:
+                indices = np.linspace(0, len(raw) - 1, int(len(raw) * SAMPLE_RATE / framerate))
+                waveform = np.interp(indices, np.arange(len(raw)), raw).astype(np.float32)
+            else:
+                waveform = raw
+            duration_seconds = len(waveform) / SAMPLE_RATE
+            if duration_seconds < AUDIO_MIN_DURATION_SECONDS or duration_seconds > AUDIO_MAX_DURATION_SECONDS:
+                raise ValueError("Audio must be between 0.3 and 10 seconds long.")
+            return waveform
+    except Exception as exc:
+        raise ValueError(f"The audio recording could not be decoded: {exc}") from exc
 
 
 def _load_audio_model() -> None:
@@ -61,6 +105,9 @@ def _load_audio_model() -> None:
     if _audio_model is not None:
         return
     if _audio_error is not None:
+        raise RuntimeError(_audio_error)
+    if torch is None:
+        _audio_error = "Audio anti-spoof model requires PyTorch (torch), which is not installed in this environment."
         raise RuntimeError(_audio_error)
     try:
         from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
@@ -125,11 +172,18 @@ def warm_transcriber() -> dict[str, str]:
             if _whisper is None:
                 from faster_whisper import WhisperModel
 
+                download_root = Path(".tools/models/whisper")
+                try:
+                    download_root.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    download_root = Path(tempfile.gettempdir()) / "models" / "whisper"
+                    download_root.mkdir(parents=True, exist_ok=True)
+
                 _whisper = WhisperModel(
                     TRANSCRIPTION_MODEL_ID,
                     device="cpu",
                     compute_type="int8",
-                    download_root=".tools/models/whisper",
+                    download_root=str(download_root),
                     revision=TRANSCRIPTION_MODEL_REVISION,
                 )
         return {

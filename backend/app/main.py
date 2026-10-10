@@ -13,7 +13,9 @@ import io
 import json
 import logging
 import os
+import pickle
 import secrets
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -264,6 +266,33 @@ _sessions: dict[UUID, SessionState] = {}
 _phone_credentials: dict[str, PhoneCredential] = {}
 _audit_ledger = SimulatedAuditLedger()
 
+_SESSION_CACHE_FILE = Path(tempfile.gettempdir()) / "fusion_sessions_cache.pickle"
+
+
+def _save_sessions_to_disk() -> None:
+    try:
+        with open(_SESSION_CACHE_FILE, "wb") as f:
+            pickle.dump((_sessions, _phone_credentials), f)
+    except Exception as err:
+        logger.debug("Could not cache sessions to disk: %s", err)
+
+
+def _load_sessions_from_disk() -> None:
+    global _sessions, _phone_credentials
+    try:
+        if _SESSION_CACHE_FILE.exists():
+            with open(_SESSION_CACHE_FILE, "rb") as f:
+                saved_sessions, saved_creds = pickle.load(f)
+                for k, v in saved_sessions.items():
+                    if k not in _sessions:
+                        _sessions[k] = v
+                for k, v in saved_creds.items():
+                    if k not in _phone_credentials:
+                        _phone_credentials[k] = v
+    except Exception as err:
+        logger.debug("Could not load cached sessions from disk: %s", err)
+
+
 app = FastAPI(
     title="Fusion Identity Verification API",
     version="0.3.0",
@@ -274,6 +303,9 @@ app = FastAPI(
 def _session(session_id: UUID) -> SessionState:
     state = _sessions.get(session_id)
     if state is None:
+        _load_sessions_from_disk()
+        state = _sessions.get(session_id)
+    if state is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return state
 
@@ -281,6 +313,7 @@ def _session(session_id: UUID) -> SessionState:
 def _ensure_active(state: SessionState) -> None:
     if utc_now() >= state.expires_at:
         _clear_expired_evidence(state)
+        _save_sessions_to_disk()
         raise HTTPException(status_code=410, detail="Session expired; start a new session")
 
 
@@ -317,11 +350,23 @@ def _public_session(state: SessionState) -> SessionView:
     )
 
 
+def _public_origin(request: Request) -> str:
+    configured = os.getenv("FUSION_PUBLIC_ORIGIN")
+    if configured:
+        return configured.rstrip("/")
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if forwarded_host:
+        proto = forwarded_proto or ("https" if "vercel.app" in forwarded_host else request.url.scheme)
+        return f"{proto}://{forwarded_host}".rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
 def _webauthn_context(request: Request) -> tuple[str, str]:
-    configured_origin = os.getenv("FUSION_WEBAUTHN_ORIGIN") or os.getenv("FUSION_PUBLIC_ORIGIN")
+    configured_origin = os.getenv("FUSION_WEBAUTHN_ORIGIN")
     configured_rp_id = os.getenv("FUSION_WEBAUTHN_RP_ID")
-    origin = (configured_origin or str(request.base_url).rstrip("/")).rstrip("/")
-    rp_id = configured_rp_id or request.url.hostname or "localhost"
+    origin = (configured_origin or _public_origin(request)).rstrip("/")
+    rp_id = configured_rp_id or urlsplit(origin).hostname or request.url.hostname or "localhost"
     parsed_origin = urlsplit(origin)
     if parsed_origin.scheme not in {"http", "https"} or not parsed_origin.hostname:
         raise HTTPException(status_code=500, detail="WebAuthn origin configuration is invalid")
@@ -334,14 +379,11 @@ def _webauthn_context(request: Request) -> tuple[str, str]:
     return rp_id, origin
 
 
-def _public_origin(request: Request) -> str:
-    return (os.getenv("FUSION_PUBLIC_ORIGIN") or str(request.base_url)).rstrip("/")
-
-
 def _set_pending_webauthn(state: SessionState, challenge: bytes, kind: Literal["registration", "authentication"]) -> None:
     state.pending_webauthn_challenge = challenge
     state.pending_webauthn_kind = kind
     state.pending_webauthn_expires_at = min(utc_now() + timedelta(minutes=2), state.expires_at)
+    _save_sessions_to_disk()
 
 
 def _take_pending_webauthn(state: SessionState, kind: Literal["registration", "authentication"]) -> bytes:
@@ -580,6 +622,20 @@ def icici_bank_logo() -> FileResponse:
     return FileResponse(ROOT / "static" / "assets" / "brands" / "icici-bank.svg", media_type="image/svg+xml")
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> Response:
+    return Response(status_code=204)
+
+
+@app.get("/assets/{asset_path:path}", include_in_schema=False)
+def generic_asset(asset_path: str) -> FileResponse:
+    target = (ROOT / "static" / "assets" / asset_path).resolve()
+    assets_dir = (ROOT / "static" / "assets").resolve()
+    if not str(target).startswith(str(assets_dir)) or not target.is_file():
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return FileResponse(target)
+
+
 @app.get("/hidden/control", include_in_schema=False)
 def hidden_qa_control(request: Request) -> FileResponse:
     if not _qa_controls_enabled(request):
@@ -723,6 +779,7 @@ def create_session() -> SessionView:
         expires_at=now + SESSION_TTL,
     )
     _sessions[state.id] = state
+    _save_sessions_to_disk()
     return _public_session(state)
 
 
@@ -748,6 +805,7 @@ def pair_phone(session_id: UUID, body: PairRequest) -> SessionView:
     if not hmac.compare_digest(state.pair_token, body.token):
         raise HTTPException(status_code=403, detail="Invalid pairing token")
     state.paired = True
+    _save_sessions_to_disk()
     return _public_session(state)
 
 
@@ -820,6 +878,7 @@ def verify_phone_registration(
     )
     state.phone_credential_id = device_id
     state.phone_verified = False
+    _save_sessions_to_disk()
     return _public_session(state)
 
 
@@ -835,6 +894,9 @@ def phone_authentication_options(
     _require_phone_token(state, x_pair_token)
     device_id = str(body.device_id)
     credential = _phone_credentials.get(device_id)
+    if credential is None:
+        _load_sessions_from_disk()
+        credential = _phone_credentials.get(device_id)
     if credential is None:
         raise HTTPException(status_code=409, detail="Register the phone's platform credential first")
     state.phone_credential_id = device_id
@@ -861,6 +923,9 @@ def verify_phone_authentication(
     _require_phone_token(state, x_pair_token)
     device_id = state.phone_credential_id
     credential = _phone_credentials.get(device_id or "")
+    if credential is None:
+        _load_sessions_from_disk()
+        credential = _phone_credentials.get(device_id or "")
     if credential is None:
         raise HTTPException(status_code=409, detail="Register the phone's platform credential first")
     supplied_id = body.credential.get("rawId")
@@ -890,6 +955,7 @@ def verify_phone_authentication(
 
     credential.sign_count = verification.new_sign_count
     state.phone_verified = True
+    _save_sessions_to_disk()
     return _public_session(state)
 
 
@@ -916,6 +982,7 @@ def create_challenge(session_id: UUID, response: Response) -> ChallengeView:
     state.last_qr_path_sample_ms = -QR_PATH_SAMPLE_INTERVAL_MS
     state.audio_result = None
     state.result = None
+    _save_sessions_to_disk()
     return _public_challenge(state.challenge)
 
 
@@ -1302,6 +1369,8 @@ async def scan_challenge_frame(
         and step is not None
         and _advance_challenge_qr(challenge, step)
     )
+    if qr_scanned:
+        _save_sessions_to_disk()
     return FrameScanResult(
         payload=payload if qr_scanned else None,
         elapsed_ms=elapsed_ms,
@@ -1636,6 +1705,7 @@ def submit_evidence(session_id: UUID, body: EvidenceSubmission) -> VerificationR
         generated_at=generated_at,
     )
     state.result = report.model_dump(mode="json")
+    _save_sessions_to_disk()
     return report
 
 
